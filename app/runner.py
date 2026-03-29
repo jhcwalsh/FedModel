@@ -1,143 +1,138 @@
 """
 runner.py — Wrapper around pyfrbus to load the FRB/US model and run simulations.
 
-The FRB/US model must be extracted from the Fed zip into the project root:
-  - models/model.xml   (model equations)
-  - models/LONGBASE.TXT (historical data — not committed to git)
-
-pyfrbus API reference:
-  from pyfrbus.frbus import Frbus
-  from pyfrbus.load_data import load_data
+File layout expected (after extracting Fed zip):
+  pyfrbus/models/model.xml    — model equations
+  pyfrbus/data/LONGBASE.TXT   — historical + extrapolated data (not committed to git)
 """
 
-import os
-import pandas as pd
+import sys
 from pathlib import Path
 
-MODEL_PATH = Path(__file__).parent.parent / "models" / "model.xml"
-DATA_PATH = Path(__file__).parent.parent / "models" / "LONGBASE.TXT"
+# Ensure pyfrbus package is importable from the project root
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-# Key output series to track across all simulations
+import pandas as pd
+
+MODEL_XML = PROJECT_ROOT / "pyfrbus" / "models" / "model.xml"
+DATA_TXT = PROJECT_ROOT / "pyfrbus" / "data" / "LONGBASE.TXT"
+
+# ── Output series shown in the UI ────────────────────────────────────────────
 OUTPUT_SERIES = {
     "Output": {
-        "xgdp": "Real GDP",
-        "xgdpgap": "Output Gap",
-        "xgdppotential": "Potential GDP",
+        "xgdp":  "Real GDP",
+        "xgap2": "Output Gap",
+        "xb":    "Real GNP",
     },
     "Inflation": {
         "pcxfe": "Core PCE Inflation",
-        "pic4": "CPI Inflation (4Q)",
-        "pgdp": "GDP Deflator",
+        "pic4":  "CPI Inflation (4Q)",
+        "pgdp":  "GDP Deflator",
     },
     "Labor": {
-        "lur": "Unemployment Rate",
-        "lex": "Employment",
-        "lww": "Average Weekly Hours",
-        "lxnfct": "Compensation per Hour",
+        "lur":   "Unemployment Rate",
+        "lep":   "Employment (Payroll)",
+        "lhp":   "Aggregate Hours",
+        "lprdt": "Labor Productivity",
     },
     "Financial": {
-        "rff": "Federal Funds Rate",
-        "rg10": "10yr Treasury Yield",
+        "rff":   "Federal Funds Rate",
+        "rg10":  "10yr Treasury Yield",
         "rg10p": "10yr Term Premium",
-        "drxy": "Real Exchange Rate",
+        "rrff":  "Real Federal Funds Rate",
     },
     "Fiscal": {
-        "gftrd": "Federal Spending",
-        "trfpt": "Federal Tax Revenues",
-        "gfdbtnipa": "Federal Deficit (NIPA)",
+        "gfexpn":  "Federal Expenditures (nominal)",
+        "gfrecn":  "Federal Receipts (nominal)",
+        "gfsrpn":  "Federal Surplus (nominal)",
+        "gfdbtnp": "Federal Debt / Potential GDP",
     },
 }
 
-# Flat mapping of variable name → label
 ALL_SERIES = {k: v for group in OUTPUT_SERIES.values() for k, v in group.items()}
+
+# Default simulation start (first future quarter in LONGBASE with stable extrapolation)
+DEFAULT_START = pd.Period("2026Q1")
+
+# Standard fiscal-rule switches applied every simulation
+FISCAL_SWITCHES = {"dfpdbt": 0, "dfpsrp": 1}
 
 
 def model_available() -> bool:
-    return MODEL_PATH.exists() and DATA_PATH.exists()
+    return MODEL_XML.exists() and DATA_TXT.exists()
 
 
-def load_model():
-    """Load the FRB/US model. Call once and cache with @st.cache_resource."""
+def load_model(mce: bool = False):
+    """
+    Load the FRB/US model.  Call once and cache with @st.cache_resource.
+
+    Parameters
+    ----------
+    mce : bool
+        True  → model-consistent expectations (mcap+wp)
+        False → VAR-based expectations (default)
+    """
     if not model_available():
         raise FileNotFoundError(
             f"FRB/US model files not found.\n"
-            f"Expected:\n  {MODEL_PATH}\n  {DATA_PATH}\n\n"
-            "Please download the PyFRB/US package and LONGBASE.TXT from:\n"
-            "https://www.federalreserve.gov/econres/us-models-python.htm\n"
-            "and extract them into the models/ directory."
+            f"Expected:\n  {MODEL_XML}\n  {DATA_TXT}\n\n"
+            "Download the PyFRB/US package + LONGBASE data from:\n"
+            "  https://www.federalreserve.gov/econres/us-models-python.htm\n"
+            "Extract the zip into the project root, then copy LONGBASE.TXT into pyfrbus/data/."
         )
     from pyfrbus.frbus import Frbus
-    return Frbus(str(MODEL_PATH))
+
+    kwargs = {"mce": "mcap+wp"} if mce else {}
+    return Frbus(str(MODEL_XML), **kwargs)
 
 
 def load_longbase() -> pd.DataFrame:
-    """Load LONGBASE historical dataset."""
+    """Load the LONGBASE historical/extrapolated dataset."""
     from pyfrbus.load_data import load_data
-    return load_data(str(DATA_PATH))
+    return load_data(str(DATA_TXT))
 
 
 def run_simulation(
     model,
     data: pd.DataFrame,
-    start: str,
-    end: str,
-    overrides: dict,
-    targ: list,
-    traj: list,
-    inst: list,
-    mce: str = "mcap+wp",
+    start: pd.Period,
+    end: pd.Period,
+    aerr_shocks: dict,          # {varname_aerr: scalar added to that period range}
+    shock_end: pd.Period = None, # last quarter of shock (defaults to end)
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Run a simulation and return (baseline_df, shocked_df) for output series.
+    Run a simulation and return (baseline_df, shocked_df).
 
     Parameters
     ----------
     model       : Frbus instance from load_model()
     data        : LONGBASE dataframe from load_longbase()
-    start       : simulation start quarter, e.g. "2024Q1"
-    end         : simulation end quarter, e.g. "2029Q4"
-    overrides   : dict of {varname: pd.Series or scalar} applied to sim before solve
-    targ        : list of target variable names (for mcontrol)
-    traj        : list of trajectory variable names (for mcontrol)
-    inst        : list of instrument variable names (for mcontrol)
-    mce         : model-consistent expectations flag; "" for VAR-based
+    start       : simulation start (pd.Period)
+    end         : simulation end   (pd.Period)
+    aerr_shocks : {variable_aerr: delta} — add-factor overrides applied start→shock_end
+    shock_end   : last quarter of shock (default = end)
 
     Returns
     -------
-    baseline    : DataFrame of baseline (no shock) values
-    shocked     : DataFrame of shocked simulation values
-    Both contain only the series in ALL_SERIES.
+    (baseline, shocked) — DataFrames containing OUTPUT_SERIES columns over [start:end]
     """
-    # --- Baseline (no overrides) ---
-    baseline_sim = model.init_trac(start, end, data)
-    if targ:
-        baseline_sim = model.mcontrol(start, end, baseline_sim, targ, traj, inst, mce=mce)
-    else:
-        baseline_sim = model.solve(start, end, baseline_sim, mce=mce)
+    shock_end = shock_end or end
 
-    # --- Shocked simulation ---
-    shocked_sim = model.init_trac(start, end, data)
-    for var, values in overrides.items():
-        if isinstance(values, (int, float)):
-            shocked_sim.loc[start:end, var] = shocked_sim.loc[start:end, var] + values
-        else:
-            shocked_sim.loc[start:end, var] = values
+    # Apply standard fiscal rule switches
+    for var, val in FISCAL_SWITCHES.items():
+        data.loc[start:end, var] = val
 
-    if targ:
-        shocked_sim = model.mcontrol(start, end, shocked_sim, targ, traj, inst, mce=mce)
-    else:
-        shocked_sim = model.solve(start, end, shocked_sim, mce=mce)
+    # Baseline: init_trac only (no extra overrides, then solve is implicit in init_trac)
+    baseline = model.init_trac(start, end, data)
 
-    available = [v for v in ALL_SERIES if v in baseline_sim.columns]
-    return baseline_sim[available].copy(), shocked_sim[available].copy()
+    # Shocked: copy baseline tracking solution, then apply add-factor shocks
+    shocked = baseline.copy()
+    for var, delta in aerr_shocks.items():
+        if var in shocked.columns:
+            shocked.loc[start:shock_end, var] += delta
 
+    shocked = model.solve(start, end, shocked)
 
-def get_simulation_dates(data: pd.DataFrame, horizon_quarters: int) -> tuple[str, str]:
-    """Return (start, end) simulation period based on last available data + horizon."""
-    last_date = data.index[-1]
-    # FRB/US uses quarterly period index — convert to string
-    start = str(last_date)
-    # Add horizon quarters
-    end_period = last_date + horizon_quarters
-    end = str(end_period)
-    return start, end
+    available = [v for v in ALL_SERIES if v in baseline.columns and v in shocked.columns]
+    return baseline.loc[start:end, available].copy(), shocked.loc[start:end, available].copy()
