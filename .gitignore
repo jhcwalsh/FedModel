@@ -1,0 +1,31 @@
+# FRB/US data — large file, not committed
+models/LONGBASE.TXT
+models/*.TXT
+models/*.edb
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+*.env
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
